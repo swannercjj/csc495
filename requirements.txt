@@ -1,0 +1,7 @@
+torch
+numpy
+stable_baselines3
+gymnasium
+ale-py
+pysc2
+protbuf==3.20
