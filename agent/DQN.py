@@ -10,7 +10,7 @@ from pysc2.lib import features
 from pysc2.agents.base_agent import BaseAgent
 
 from agent.replay import ReplayMemory, Transition
-from agent.utils import FLAT_FEATURES, Preprocessor
+from agent.utils import FLAT_FEATURES
 import numpy as np
 
 _NO_OP = actions.FUNCTIONS.no_op.id
@@ -56,92 +56,89 @@ class DQNAgent(BaseAgent):
 
         self.steps_done = 0
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.preproc = Preprocessor()
 
         self.last_state = None
         self.last_action = None
+
+    def _get_from_spec(self, spec, key):
+        """Get value from obs_spec whether it's dict-like or has the key as attr."""
+        if spec is None:
+            return None
+        try:
+            return spec[key]
+        except (KeyError, TypeError):
+            pass
+        return getattr(spec, key, None)
 
     def setup(self, obs_spec, action_spec):
         super().setup(obs_spec, action_spec)
         self.n_actions = len(action_spec.functions)
 
-        # Compute observation size: flat player features + optionally flattened screen
-        # obs_spec is a NamedDict with feature_screen etc. at top level (no .observation)
-        # n_flat = len(FLAT_FEATURES)
-        # feat_screen = self._get_from_spec(obs_spec, 'feature_screen')
-        # if feat_screen is not None:
-        #     # feat_screen can be tuple (channels, height, width) or array-like with .shape
-        #     if isinstance(feat_screen, (tuple, list)):
-        #         n_screen, h, w = feat_screen[0], feat_screen[1], feat_screen[2]
-        #     else:
-        #         n_screen, h, w = feat_screen.shape[0], feat_screen.shape[1], feat_screen.shape[2]
-        #     # Downsample screen to 8x8 per channel (compute pooling from spec)
-        #     self.screen_pool_h, self.screen_pool_w = max(1, h // 8), max(1, w // 8)
-        #     # Compute trimmed dims (multiples of pool size) to avoid reshape errors
-        #     self.screen_trim_h = (h // self.screen_pool_h) * self.screen_pool_h
-        #     self.screen_trim_w = (w // self.screen_pool_w) * self.screen_pool_w
-        #     n_screen_flat = n_screen * (self.screen_trim_h // self.screen_pool_h) * (self.screen_trim_w // self.screen_pool_w)
-        #     self.screen_shape = (n_screen, h, w)
-        # else:
-        #     self.screen_pool_h = self.screen_pool_w = 0
-        #     n_screen_flat = 0
-        #     self.screen_shape = None
-        # self.n_observations = n_flat + n_screen_flat
+        # Compute observation size from PySC2 obs_spec: flat player features + optional flattened screen
+        n_flat = len(FLAT_FEATURES)
+        feat_screen = self._get_from_spec(obs_spec, 'feature_screen')
+        if feat_screen is not None:
+            if isinstance(feat_screen, (tuple, list)):
+                n_screen, h, w = feat_screen[0], feat_screen[1], feat_screen[2]
+            else:
+                n_screen, h, w = feat_screen.shape[0], feat_screen.shape[1], feat_screen.shape[2]
+            self.screen_pool_h, self.screen_pool_w = max(1, h // 8), max(1, w // 8)
+            self.screen_trim_h = (h // self.screen_pool_h) * self.screen_pool_h
+            self.screen_trim_w = (w // self.screen_pool_w) * self.screen_pool_w
+            n_screen_flat = n_screen * (self.screen_trim_h // self.screen_pool_h) * (self.screen_trim_w // self.screen_pool_w)
+            self.screen_shape = (n_screen, h, w)
+        else:
+            self.screen_pool_h = self.screen_pool_w = 0
+            n_screen_flat = 0
+            self.screen_shape = None
+        self.n_observations = n_flat + n_screen_flat
 
-        # Create networks now using the computed `n_observations` from spec.
         self.q_network = QNetwork(self.n_observations, self.n_actions).to(self.device)
         self.target_network = QNetwork(self.n_observations, self.n_actions).to(self.device)
         self.target_network.load_state_dict(self.q_network.state_dict())
         self.optimizer = optim.Adam(self.q_network.parameters(), lr=self.lr)
 
-    # def _get_obs(self, obs):
-    #     """Convert PySC2 observation to flat tensor."""
-    #     parts = []
+    def _get_obs(self, obs):
+        """Convert PySC2 timestep observation to flat tensor for the DQN."""
+        observation = obs.observation
+        parts = []
 
-    #     # Flat player features
-    #     player = obs.observation.player
-    #     flat = np.array([player[f.index] for f in FLAT_FEATURES if f.index < len(player)], dtype=np.float32)
-    #     parts.append(flat)
+        # Flat player features: always length n_flat so observation size is fixed
+        n_flat = len(FLAT_FEATURES)
+        player = np.asarray(observation.player, dtype=np.float32)
+        flat = np.zeros(n_flat, dtype=np.float32)
+        for f in FLAT_FEATURES:
+            if f.index < len(player):
+                flat[f.index] = player[f.index]
+        parts.append(flat)
 
-    #     # Downsampled screen features using pooling sizes computed in setup().
-    #     if obs.observation.feature_screen is not None and getattr(self, 'screen_pool_h', 0) > 0:
-    #         screen = obs.observation.feature_screen
-    #         # screen shape: (channels, height, width)
-    #         h, w = screen.shape[1], screen.shape[2]
-    #         pool_h, pool_w = self.screen_pool_h, self.screen_pool_w
-    #         # Use the trimmed dims computed in setup as a target; allow cropping if runtime is larger.
-    #         target_h = min(h, getattr(self, 'screen_trim_h', h))
-    #         target_w = min(w, getattr(self, 'screen_trim_w', w))
-    #         h_trim = (target_h // pool_h) * pool_h
-    #         w_trim = (target_w // pool_w) * pool_w
-    #         if h_trim == 0 or w_trim == 0:
-    #             parts.append(screen.flatten().astype(np.float32))
-    #         else:
-    #             screen_cropped = screen[:, :h_trim, :w_trim]
-    #             screen_flat = screen_cropped.reshape(screen.shape[0], h_trim // pool_h, pool_h, w_trim // pool_w, pool_w)
-    #             screen_flat = screen_flat.mean(axis=(2, 4))  # (channels, h', w')
-    #             flat_arr = screen_flat.flatten().astype(np.float32)
-    #             # Pad or truncate to match expected length from setup
-    #             expected = (getattr(self, 'screen_trim_h', h) // pool_h) * (getattr(self, 'screen_trim_w', w) // pool_w) * screen.shape[0]
-    #             if flat_arr.size < expected:
-    #                 pad = np.zeros(expected - flat_arr.size, dtype=np.float32)
-    #                 flat_arr = np.concatenate([flat_arr, pad])
-    #             elif flat_arr.size > expected:
-    #                 flat_arr = flat_arr[:expected]
-    #             parts.append(flat_arr)
+        # Downsampled screen (only if setup() found feature_screen in obs_spec)
+        screen = observation['feature_screen']
+        n_screen_flat = (self.screen_trim_h // self.screen_pool_h) * (self.screen_trim_w // self.screen_pool_w) * self.screen_shape[0]
+        if screen is not None:
+            screen = np.asarray(screen)
+            h, w = screen.shape[1], screen.shape[2]
+            pool_h, pool_w = self.screen_pool_h, self.screen_pool_w
+            target_h = min(h, self.screen_trim_h)
+            target_w = min(w, self.screen_trim_w)
+            h_trim = (target_h // pool_h) * pool_h
+            w_trim = (target_w // pool_w) * pool_w
+            if h_trim > 0 and w_trim > 0:
+                screen_cropped = screen[:, :h_trim, :w_trim]
+                screen_flat = screen_cropped.reshape(screen.shape[0], h_trim // pool_h, pool_h, w_trim // pool_w, pool_w)
+                screen_flat = screen_flat.mean(axis=(2, 4)).flatten().astype(np.float32)
+                if screen_flat.size < n_screen_flat:
+                    screen_flat = np.concatenate([screen_flat, np.zeros(n_screen_flat - screen_flat.size, dtype=np.float32)])
+                elif screen_flat.size > n_screen_flat:
+                    screen_flat = screen_flat[:n_screen_flat]
+                parts.append(screen_flat)
+            else:
+                parts.append(np.zeros(n_screen_flat, dtype=np.float32))
+        else:
+            parts.append(np.zeros(n_screen_flat, dtype=np.float32))
 
-    #     x = np.concatenate(parts)
-    #     return torch.from_numpy(x).float().unsqueeze(0).to(self.device)
-
-    # def _get_from_spec(self, spec, key):
-    #     """Get value from obs_spec whether it's dict-like or has the key as attr."""
-    #     if spec is None:
-    #         return None
-    #     try:
-    #         return spec[key]
-    #     except (KeyError, TypeError):
-    #         pass
-    #     return getattr(spec, key, None)
+        x = np.concatenate(parts)
+        return torch.from_numpy(x).float().unsqueeze(0).to(self.device)
 
     def _action_to_function_call(self, function_id, obs):
         """Convert function_id to PySC2 FunctionCall with valid args."""
@@ -149,15 +146,15 @@ class DQNAgent(BaseAgent):
         args = []
         for arg in func.args:
             sizes = arg.sizes
-            if len(sizes) == 2:  # spatial (screen/minimap)
-                # Use center of screen as default
-                if obs.observation.feature_screen is not None:
-                    h, w = obs.observation.feature_screen.shape[1], obs.observation.feature_screen.shape[2]
+            if len(sizes) == 2:
+                if obs.observation['feature_screen'] is not None:
+                    h, w = obs.observation['feature_screen'].shape[1], obs.observation['feature_screen'].shape[2]
                 else:
                     h, w = 64, 64
                 args.append([w // 2, h // 2])
             else:
                 args.append([np.random.randint(0, s) for s in sizes])
+        print(function_id)
         return actions.FunctionCall(function_id, args)
 
     def reset(self):
@@ -165,19 +162,20 @@ class DQNAgent(BaseAgent):
         self.last_state = None
         self.last_action = None
 
-    def step(self, timestep):
-        super(DQNAgent, self).step(timestep)
-        obs = timestep.observation
-        reward = timestep.reward
-        done = timestep.last()
+    def step(self, obs):
+        super(DQNAgent, self).step(obs)
+        reward = obs.reward
+        if reward > 0:
+            print(reward)
+        done = obs.last()
 
-        state = self._get_obs(timestep)
-        available_actions = obs.available_actions
+        state = self._get_obs(obs)
+        available_actions = obs.observation['available_actions']
 
         # Store transition from previous step
         if self.last_state is not None and self.last_action is not None:
             next_state = None if done else state
-            self.memory.push(self.last_state, self.last_action, torch.tensor([[reward]], device=self.device, dtype=torch.float), next_state)
+            self.memory.push(self.last_state, self.last_action, next_state, torch.tensor([[reward]], device=self.device, dtype=torch.float))
             self.optimize()
 
         # Update target network periodically
@@ -201,7 +199,7 @@ class DQNAgent(BaseAgent):
         else:
             function_id = np.random.choice(available_actions)
 
-        function_call = self._action_to_function_call(function_id, timestep)
+        function_call = self._action_to_function_call(function_id, obs)
 
         # Store for next transition
         self.last_state = state
