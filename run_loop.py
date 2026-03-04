@@ -14,9 +14,10 @@
 """A run loop for agent/environment interaction."""
 
 import time
+import os
 
 
-def run_loop(agents, env, max_frames=0, max_episodes=0):
+def run_loop(agents, env, max_frames=0, max_episodes=0, checkpoint_dir=None):
   """A run loop to have agents and an environment interact."""
   total_frames = 0
   total_episodes = 0
@@ -42,6 +43,14 @@ def run_loop(agents, env, max_frames=0, max_episodes=0):
         if timesteps[0].last():
           break
         timesteps = env.step(actions)
+      # Episode finished: allow agents to checkpoint based on episode count.
+      if checkpoint_dir is not None:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+      for agent in agents:
+        interval = getattr(agent, "checkpoint_interval", 2)
+        if interval and hasattr(agent, "save_checkpoint"):
+          if total_episodes % interval == 0:
+            agent.save_checkpoint(total_episodes, checkpoint_dir=checkpoint_dir)
   except KeyboardInterrupt:
     pass
   finally:

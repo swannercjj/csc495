@@ -17,6 +17,8 @@
 import importlib
 import threading
 import run_loop
+import os
+from datetime import datetime
 
 from absl import app
 from absl import flags
@@ -27,9 +29,14 @@ from pysc2.env import sc2_env
 from pysc2.lib import point_flag
 from pysc2.lib import stopwatch
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 
 FLAGS = flags.FLAGS
-flags.DEFINE_bool("render", True, "Whether to render with pygame.")
+flags.DEFINE_bool("render", False, "Whether to render with pygame.")
 point_flag.DEFINE_point("feature_screen_size", "84",
                         "Resolution for screen feature layers.")
 point_flag.DEFINE_point("feature_minimap_size", "64",
@@ -79,8 +86,13 @@ flags.DEFINE_string("map", None, "Name of a map to use.")
 flags.DEFINE_bool("battle_net_map", False, "Use the battle.net map version.")
 flags.mark_flag_as_required("map")
 
+flags.DEFINE_bool("wandb", False, "Enable Weights & Biases logging.")
+flags.DEFINE_string("wandb_entity", "swannercjj", "W&B entity.")
+flags.DEFINE_string("wandb_project", "csc495", "W&B project name.")
+flags.DEFINE_string("wandb_run_name", None, "Optional W&B run name.")
 
-def run_thread(agent_classes, players, map_name, visualize):
+
+def run_thread(agent_classes, players, map_name, visualize, checkpoint_dir=None):
     """Run one thread worth of the environment with agents."""
     with sc2_env.SC2Env(
             map_name=map_name,
@@ -99,8 +111,8 @@ def run_thread(agent_classes, players, map_name, visualize):
             disable_fog=FLAGS.disable_fog,
             visualize=visualize) as env:
         env = available_actions_printer.AvailableActionsPrinter(env)
-        agents = [agent_cls() for agent_cls in agent_classes]
-        run_loop.run_loop(agents, env, FLAGS.max_agent_steps, FLAGS.max_episodes)
+        agents = [agent_cls(checkpoint_dir=checkpoint_dir) for agent_cls in agent_classes]
+        run_loop.run_loop(agents, env, FLAGS.max_agent_steps, FLAGS.max_episodes, checkpoint_dir=checkpoint_dir)
         if FLAGS.save_replay:
             env.save_replay(agent_classes[0].__name__)
 
@@ -111,6 +123,22 @@ def main(args):
         stopwatch.sw.trace()
     elif FLAGS.profile:
         stopwatch.sw.enable()
+
+    if wandb is not None and FLAGS.wandb:
+        wandb.init(
+            entity=FLAGS.wandb_entity,
+            project=FLAGS.wandb_project,
+            name=FLAGS.wandb_run_name,
+            config={
+                "map": FLAGS.map,
+                "agent": FLAGS.agent,
+                "agent2": FLAGS.agent2,
+                "difficulty": FLAGS.difficulty,
+                "step_mul": FLAGS.step_mul,
+                "max_episodes": FLAGS.max_episodes,
+                "max_agent_steps": FLAGS.max_agent_steps,
+            },
+        )
 
     map_inst = maps.get(FLAGS.map)
 
@@ -135,14 +163,19 @@ def main(args):
             players.append(sc2_env.Agent(sc2_env.Race[FLAGS.agent2_race],
                                         FLAGS.agent2_name or agent_name))
 
+    # Build a per-run checkpoint directory based on agent type and time.
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    primary_agent_name = agent_classes[0].__name__
+    checkpoint_dir = os.path.join("checkpoints", primary_agent_name, run_timestamp)
+
     threads = []
     for _ in range(FLAGS.parallel - 1):
         t = threading.Thread(target=run_thread,
-                            args=(agent_classes, players, FLAGS.map, False))
+                            args=(agent_classes, players, FLAGS.map, False, checkpoint_dir))
         threads.append(t)
         t.start()
 
-    run_thread(agent_classes, players, FLAGS.map, FLAGS.render)
+    run_thread(agent_classes, players, FLAGS.map, FLAGS.render, checkpoint_dir)
 
     for t in threads:
         t.join()

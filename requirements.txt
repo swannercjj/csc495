@@ -5,3 +5,4 @@ gymnasium
 ale-py
 pysc2
 protbuf==3.20
+wandb
