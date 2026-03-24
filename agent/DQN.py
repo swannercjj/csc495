@@ -12,6 +12,8 @@ from pysc2.agents.base_agent import BaseAgent
 
 from agent.replay import ReplayMemory, Transition
 from agent.utils import FLAT_FEATURES
+from agent.alphastar.encoders import SpatialEncoder, ScalarEncoder
+from agent.alphastar.constants import SPATIAL_HIDDEN_DIM, SCALAR_HIDDEN_DIM
 import numpy as np
 
 try:
@@ -25,34 +27,44 @@ _NO_OP = actions.FUNCTIONS.no_op.id
 _PLAYER_SELF = features.PlayerRelative.SELF
 
 
+# TODO: simplify scenario
+
 class QNetwork(nn.Module):
-    def __init__(self, screen_channels, screen_size, flat_size, n_actions):
+    """
+    Q-network backed by AlphaStar encoders.
+
+    Observation streams
+    -------------------
+    obs_dict['spatial'] : (B, 8, H, W)  – 8 screen feature planes
+    obs_dict['scalar']  : (B, 11)       – player stats vector
+
+    Encoding
+    --------
+    SpatialEncoder  →  (B, SPATIAL_HIDDEN_DIM=256)  ResBlock CNN
+    ScalarEncoder   →  (B, SCALAR_HIDDEN_DIM=128)   log1p + LayerNorm MLP
+
+    Head
+    ----
+    cat([spatial_enc, scalar_enc]) → (B, 384) → Linear(384, 256) → Linear(256, n_actions)
+    """
+
+    def __init__(self, n_actions: int):
         super(QNetwork, self).__init__()
-        # CNN for the screen (extracts "where the units are")
-        self.conv = nn.Sequential(
-            nn.Conv2d(screen_channels, 16, kernel_size=5, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=3, stride=2),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((14, 14)),
-            nn.Flatten()
-        )
-        
-        # Calculate the size of the conv output
-        # For a 64x64 input, this is usually 32 * 14 * 14
-        conv_out_size = 32 * 14 * 14 
-        
-        # Combined Fully Connected Layers
+        self.spatial_encoder = SpatialEncoder()   # 8 ch → (B, 256)
+        self.scalar_encoder  = ScalarEncoder()    # 11-dim → (B, 128)
+
+        combined_dim = SPATIAL_HIDDEN_DIM + SCALAR_HIDDEN_DIM  # 384
         self.fc = nn.Sequential(
-            nn.Linear(conv_out_size + flat_size, 256),
+            nn.Linear(combined_dim, 256),
             nn.ReLU(),
-            nn.Linear(256, n_actions)
+            nn.Linear(256, n_actions),
         )
 
-    def forward(self, obs_dict):
-        screen_features = self.conv(obs_dict['screen'])
-        combined = torch.cat([screen_features, obs_dict['flat']], dim=1)
-        return self.fc(combined)
+    def forward(self, obs_dict: dict) -> torch.Tensor:
+        _, spatial_enc = self.spatial_encoder(obs_dict['spatial'])  # (B, 256)
+        scalar_enc     = self.scalar_encoder(obs_dict['scalar'])    # (B, 128)
+        combined = torch.cat([spatial_enc, scalar_enc], dim=1)      # (B, 384)
+        return self.fc(combined)                                    # (B, n_actions)
 
 
 class DQNAgent(BaseAgent):
@@ -94,6 +106,7 @@ class DQNAgent(BaseAgent):
         self.episode_index = 0
         self.last_loss = None
         self.epsilon = self.eps_start
+        self.prev_self_health = 0.0
 
     def save_checkpoint(self, episode_index=None, checkpoint_dir=None):
         # Prefer an explicit directory passed in; fall back to the agent's own.
@@ -129,33 +142,13 @@ class DQNAgent(BaseAgent):
 
     def setup(self, obs_spec, action_spec):
         super().setup(obs_spec, action_spec)
-        
-        # 1. Action space size
+
         self.n_actions = len(action_spec.functions)
 
-        # 2. Screen specs (Spatial)
-        # We chose 3 channels (Player Relative, Selected, Unit Type)
-        self.screen_channels = 3 
-        self.screen_size = 64 # Assuming 64x64 map
-        
-        # 3. Flat spec (Non-spatial)
-        # The 'player' array in SC2 is always length 11
-        # [player_id, minerals, vespene, food_used, food_cap, food_army, 
-        #  food_workers, idle_worker_count, army_count, warp_gate_count, larva_count]
-        self.flat_size = 11 
-
-        # 4. Initialize QNetwork
-        self.q_network = QNetwork(
-            screen_channels=self.screen_channels,
-            screen_size=self.screen_size,
-            flat_size=self.flat_size,
-            n_actions=self.n_actions
-        ).to(self.device)
-
-        self.target_network = QNetwork(
-            self.screen_channels, self.screen_size, self.flat_size, self.n_actions
-        ).to(self.device)
-        
+        # QNetwork uses AlphaStar encoders internally;
+        # no need to pass explicit screen_channels / flat_size.
+        self.q_network = QNetwork(n_actions=self.n_actions).to(self.device)
+        self.target_network = QNetwork(n_actions=self.n_actions).to(self.device)
         self.target_network.load_state_dict(self.q_network.state_dict())
         self.optimizer = optim.Adam(self.q_network.parameters(), lr=self.lr)
 
@@ -203,42 +196,40 @@ class DQNAgent(BaseAgent):
 
     def _get_obs(self, obs):
         observation = obs.observation
-        
-        # 1. Spatial Features (The "Map")
-        # Pick relevant layers: 5 is 'player_relative' (Self, Enemy, Neutral)
-        # 6 is 'selected', 7 is 'unit_type'
-        screen_layers = [5, 6, 7] 
-        screen = np.array(observation['feature_screen'][screen_layers], dtype=np.float32)
-        # Shape: (3, 64, 64)
-        
-        # 2. Flat Features (The "Stats")
-        # Player info: [minerals, vespene, food_used, food_cap, ...]
-        player_data = np.log1p(np.array(observation.player, dtype=np.float32)) # Log scale helps DQN
-        
+
+        # Spatial: 8 screen feature planes matching SpatialEncoder's SPATIAL_CHANNELS=8
+        screen = observation['feature_screen']
+        planes = np.stack([
+            screen.player_relative,
+            screen.unit_type,
+            screen.selected,
+            screen.unit_hit_points_ratio,
+            screen.unit_shields_ratio,
+            screen.unit_density,
+            screen.creep,
+            screen.height_map,
+        ], axis=0).astype(np.float32)                                     # (8, H, W)
+
+        # Scalar: log1p-normalised player stats (ScalarEncoder applies log1p
+        # internally too, but passing raw values lets the encoder do it consistently)
+        player_data = np.array(observation.player, dtype=np.float32)     # (11,)
+
         return {
-            'screen': torch.from_numpy(screen).unsqueeze(0).to(self.device),
-            'flat': torch.from_numpy(player_data).unsqueeze(0).to(self.device)
+            'spatial': torch.from_numpy(planes).unsqueeze(0).to(self.device),     # (1, 8, H, W)
+            'scalar':  torch.from_numpy(player_data).unsqueeze(0).to(self.device) # (1, 11)
         }
 
     def _action_to_function_call(self, function_id, obs):
         """Convert function_id to PySC2 FunctionCall with valid args."""
         func = self.action_spec.functions[function_id]
-        args = []
-        for arg in func.args:
-            sizes = arg.sizes
-            if len(sizes) == 2:
-                if obs.observation['feature_screen'] is not None:
-                    h, w = obs.observation['feature_screen'].shape[1], obs.observation['feature_screen'].shape[2]
-                else:
-                    h, w = 64, 64
-                args.append([w // 2, h // 2])
-            else:
-                args.append([np.random.randint(0, s) for s in sizes])
+        args = [[np.random.randint(0, size) for size in arg.sizes]
+                for arg in func.args]
         return actions.FunctionCall(function_id, args)
 
     def reset(self):
         super(DQNAgent, self).reset()
         self.prev_score = np.zeros(13, dtype=np.float32)
+        self.prev_self_health = 0.0
         self.last_state = None
         self.last_action = None
         self.episode_return = 0.0
@@ -299,11 +290,13 @@ class DQNAgent(BaseAgent):
             if WANDB_AVAILABLE and wandb.run is not None:
                 wandb.log(
                     {
-                        "episode": self.episode_index,
-                        "episode_return": self.episode_return,
-                        "episode_length": self.episode_step,
-                        "epsilon": self.epsilon,
-                        "steps_done": self.steps_done,
+                        "episode": int(self.episode_index),
+                        "episode_return": float(self.episode_return),
+                        "episode_length": int(self.episode_step),
+                        "epsilon": float(self.epsilon),
+                        "steps_done": int(self.steps_done),
+                        "last_loss": float(self.last_loss) if self.last_loss is not None else 0.0,
+                        "outcome": float(obs.reward)
                     }
                 )
 
@@ -311,14 +304,19 @@ class DQNAgent(BaseAgent):
 
     def _get_shaped_reward(self, obs):
         current_score = np.asarray(obs.observation['score_cumulative'], dtype=np.float32)
+        current_self_health = self._get_total_self_health(obs)
 
         # Initialize tracking on the first step
         if self.episode_step == 0:
             self.prev_score = current_score
+            self.prev_self_health = current_self_health
             return 0.0
 
         delta = current_score - self.prev_score
         self.prev_score = current_score
+
+        health_delta = current_self_health - self.prev_self_health
+        self.prev_self_health = current_self_health
 
         # Define weights
         weights = {
@@ -327,6 +325,7 @@ class DQNAgent(BaseAgent):
             'kill_unit': 0.1,            # Aggression reward
             'kill_building': 0.2,
             'spent_resources': 0.005,    # Reward for building/training
+            'health_loss': 0.02,         # Penalty when own unit health/shields decrease
             'time_penalty': -0.0005,
             'win_loss': 1.0              # Game outcome
         }
@@ -334,6 +333,7 @@ class DQNAgent(BaseAgent):
         # Calculate the components
         # Index 11/12 are spent minerals/vespene
         spent_delta = delta[11] + delta[12]
+        health_loss_penalty = min(0.0, health_delta) * weights['health_loss']
         
         # Combine everything
         total_reward = (
@@ -342,11 +342,32 @@ class DQNAgent(BaseAgent):
             (delta[5] * weights['kill_unit']) +
             (delta[6] * weights['kill_building']) +
             (spent_delta * weights['spent_resources']) +  # Production reward
+            health_loss_penalty +                         # Damage taken penalty
             weights['time_penalty'] +                     # Constant tick penalty
             (obs.reward * weights['win_loss'])
         )
 
         return float(np.clip(total_reward, -1.0, 1.0))
+
+    def _get_total_self_health(self, obs):
+        """Estimate total allied health from feature screen planes."""
+        screen = obs.observation['feature_screen']
+        if screen is None:
+            return 0.0
+
+        player_relative = np.asarray(screen.player_relative)
+        hp_ratio = np.asarray(screen.unit_hit_points_ratio, dtype=np.float32)
+        shield_ratio = np.asarray(screen.unit_shields_ratio, dtype=np.float32)
+
+        # PySC2 ratio planes are commonly [0, 255]; normalise if needed.
+        if hp_ratio.max(initial=0.0) > 1.0:
+            hp_ratio = hp_ratio / 255.0
+        if shield_ratio.max(initial=0.0) > 1.0:
+            shield_ratio = shield_ratio / 255.0
+
+        self_mask = (player_relative == _PLAYER_SELF)
+        total_health = (hp_ratio + shield_ratio)[self_mask].sum()
+        return float(total_health)
         
     def optimize(self):
         if len(self.memory) < self.batch_size:
@@ -360,29 +381,26 @@ class DQNAgent(BaseAgent):
                                     device=self.device, dtype=torch.bool)
         
         # 2. Extract and stack the inputs for the current state
-        # Each 's' in batch.state is now {'screen': tensor, 'flat': tensor}
-        state_screens = torch.cat([s['screen'] for s in batch.state])
-        state_flats = torch.cat([s['flat'] for s in batch.state])
+        # Each 's' in batch.state is now {'spatial': tensor, 'scalar': tensor}
+        state_spatials = torch.cat([s['spatial'] for s in batch.state])
+        state_scalars  = torch.cat([s['scalar']  for s in batch.state])
         
         action_batch = torch.cat(batch.action)
         reward_batch = torch.cat(batch.reward)
 
-        # 3. Compute Q(s_t, a) - the model predicts Q-values for all actions
-        # We pass the dictionary/tensors to model
-        current_q_values = self.q_network({'screen': state_screens, 'flat': state_flats})
+        # 3. Compute Q(s_t, a)
+        current_q_values = self.q_network({'spatial': state_spatials, 'scalar': state_scalars})
         state_action_values = current_q_values.gather(1, action_batch)
 
-        # 4. Compute V(s_{t+1}) for all next states.
+        # 4. Compute V(s_{t+1}) for all non-terminal next states
         next_state_values = torch.zeros(self.batch_size, device=self.device)
         if non_final_mask.any():
-            # Filter out the None states (terminal states)
-            non_final_next_screens = torch.cat([s['screen'] for s in batch.next_state if s is not None])
-            non_final_next_flats = torch.cat([s['flat'] for s in batch.next_state if s is not None])
+            non_final_next_spatials = torch.cat([s['spatial'] for s in batch.next_state if s is not None])
+            non_final_next_scalars  = torch.cat([s['scalar']  for s in batch.next_state if s is not None])
             
             with torch.no_grad():
-                # Double DQN or simple DQN: we use target_network for stability
-                target_output = self.target_network({'screen': non_final_next_screens, 
-                                                    'flat': non_final_next_flats})
+                target_output = self.target_network({'spatial': non_final_next_spatials,
+                                                     'scalar':  non_final_next_scalars})
                 next_state_values[non_final_mask] = target_output.max(1)[0]
 
         # 5. Compute the expected Q values (Bellman Equation)

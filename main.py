@@ -111,7 +111,10 @@ def run_thread(agent_classes, players, map_name, visualize, checkpoint_dir=None)
             disable_fog=FLAGS.disable_fog,
             visualize=visualize) as env:
         env = available_actions_printer.AvailableActionsPrinter(env)
-        agents = [agent_cls(checkpoint_dir=checkpoint_dir) for agent_cls in agent_classes]
+        if checkpoint_dir is not None:
+            agents = [agent_cls(checkpoint_dir=checkpoint_dir) for agent_cls in agent_classes]
+        else:
+            agents = [agent_cls() for agent_cls in agent_classes]
         run_loop.run_loop(agents, env, FLAGS.max_agent_steps, FLAGS.max_episodes, checkpoint_dir=checkpoint_dir)
         if FLAGS.save_replay:
             env.save_replay(agent_classes[0].__name__)
@@ -166,7 +169,8 @@ def main(args):
     # Build a per-run checkpoint directory based on agent type and time.
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     primary_agent_name = agent_classes[0].__name__
-    checkpoint_dir = os.path.join("checkpoints", primary_agent_name, run_timestamp)
+    # checkpoint_dir = os.path.join("checkpoints", primary_agent_name, run_timestamp)
+    checkpoint_dir = None
 
     threads = []
     for _ in range(FLAGS.parallel - 1):

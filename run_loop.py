@@ -46,11 +46,11 @@ def run_loop(agents, env, max_frames=0, max_episodes=0, checkpoint_dir=None):
       # Episode finished: allow agents to checkpoint based on episode count.
       if checkpoint_dir is not None:
         os.makedirs(checkpoint_dir, exist_ok=True)
-      for agent in agents:
-        interval = getattr(agent, "checkpoint_interval", 2)
-        if interval and hasattr(agent, "save_checkpoint"):
-          if total_episodes % interval == 0:
-            agent.save_checkpoint(total_episodes, checkpoint_dir=checkpoint_dir)
+        for agent in agents:
+          interval = getattr(agent, "checkpoint_interval", 2)
+          if interval and hasattr(agent, "save_checkpoint"):
+            if total_episodes % interval == 0:
+              agent.save_checkpoint(total_episodes, checkpoint_dir=checkpoint_dir)
   except KeyboardInterrupt:
     pass
   finally:
