@@ -13,14 +13,32 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from agent.alphastar.constants import (
-    SCALAR_DIM, SCALAR_HIDDEN_DIM,
-    ENTITY_FEATURE_DIM, ENTITY_HIDDEN_DIM,
-    NUM_TRANSFORMER_HEADS, NUM_TRANSFORMER_LAYERS,
-    SPATIAL_CHANNELS, SPATIAL_SIZE, SPATIAL_HIDDEN_DIM,
-    MAX_ENTITIES, MAX_UNIT_TYPES,
-    UNIT_TYPE_EMBEDDING_DIM, RAW_ENTITY_NUMERIC_DIM,
-)
+SCALAR_DIM = 11          # Length of the 'player' feature array
+                         # [player_id, minerals, vespene, food_used, food_cap,
+                         #  food_army, food_workers, idle_workers, army_count,
+                         #  warp_gate_count, larva_count]
+
+MAX_ENTITIES = 256               # Maximum number of units/buildings per step
+MAX_UNIT_TYPES = 1900            # Upper bound on SC2 unit-type IDs
+UNIT_TYPE_EMBEDDING_DIM = 32     # Embedding dimension for unit_type ID
+RAW_ENTITY_NUMERIC_DIM = 16      # Number of raw numeric features per entity
+                                 # (health_ratio, shield_ratio, energy_ratio,
+                                 #  build_progress, is_selected, is_blip,
+                                 #  is_powered, x, y, radius,
+                                 #  weapon_cooldown, alliance_onehot×4)
+
+ENTITY_FEATURE_DIM = UNIT_TYPE_EMBEDDING_DIM + RAW_ENTITY_NUMERIC_DIM  # 48
+ENTITY_HIDDEN_DIM = 256  # Transformer model dimension
+NUM_TRANSFORMER_HEADS = 4
+NUM_TRANSFORMER_LAYERS = 3
+
+SPATIAL_CHANNELS = 8     # Number of screen feature planes used
+SPATIAL_SIZE = 64        # Assumed map resolution (64×64)
+
+LSTM_HIDDEN_DIM = 512
+ACTION_EMBED_DIM = 64    # Embedding dim for the auto-regressively chosen action type
+SCALAR_HIDDEN_DIM = 128  # Output dim of ScalarEncoder
+SPATIAL_HIDDEN_DIM = 256 # Output dim of SpatialEncoder projection
 
 
 class ResBlock(nn.Module):
