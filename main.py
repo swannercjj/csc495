@@ -15,9 +15,11 @@
 """Run an agent."""
 
 import importlib
+import inspect
 import threading
 import run_loop
 import os
+import tempfile
 from datetime import datetime
 
 from absl import app
@@ -28,6 +30,8 @@ from pysc2.env import available_actions_printer
 from pysc2.env import sc2_env
 from pysc2.lib import point_flag
 from pysc2.lib import stopwatch
+
+from agent.artifact_store import is_s3_uri, join_artifact_path, upload_file
 
 try:
     import wandb
@@ -81,6 +85,18 @@ flags.DEFINE_bool("trace", False, "Whether to trace the code execution.")
 flags.DEFINE_integer("parallel", 1, "How many instances to run in parallel.")
 
 flags.DEFINE_bool("save_replay", True, "Whether to save a replay at the end.")
+flags.DEFINE_enum("artifact_backend", "local", ["local", "s3"],
+                  "Where to store checkpoints and replays.")
+flags.DEFINE_string("checkpoint_dir", "checkpoints",
+                    "Directory or s3:// prefix for training checkpoints.")
+flags.DEFINE_string("replay_dir", "replays",
+                    "Directory or s3:// prefix for saved replays.")
+flags.DEFINE_string("resume_checkpoint", None,
+                    "Optional checkpoint path or s3:// URI to resume from.")
+flags.DEFINE_string("sc2path", None,
+                    "Optional StarCraft II install path for local or remote runs.")
+flags.DEFINE_bool("headless", False,
+                    "Force headless execution even if render is enabled.")
 
 flags.DEFINE_string("map", None, "Name of a map to use.")
 flags.DEFINE_bool("battle_net_map", False, "Use the battle.net map version.")
@@ -92,7 +108,18 @@ flags.DEFINE_string("wandb_project", "csc495", "W&B project name.")
 flags.DEFINE_string("wandb_run_name", None, "Optional W&B run name.")
 
 
-def run_thread(agent_classes, players, map_name, visualize, checkpoint_dir=None):
+def _instantiate_agent(agent_cls, checkpoint_dir=None, resume_checkpoint=None):
+    kwargs = {}
+    signature = inspect.signature(agent_cls)
+    if "checkpoint_dir" in signature.parameters:
+        kwargs["checkpoint_dir"] = checkpoint_dir
+    if "resume_checkpoint" in signature.parameters and resume_checkpoint:
+        kwargs["resume_checkpoint"] = resume_checkpoint
+    return agent_cls(**kwargs)
+
+
+def run_thread(agent_classes, players, map_name, visualize, checkpoint_dir=None,
+               replay_dir=None, resume_checkpoint=None):
     """Run one thread worth of the environment with agents."""
     with sc2_env.SC2Env(
             map_name=map_name,
@@ -112,16 +139,38 @@ def run_thread(agent_classes, players, map_name, visualize, checkpoint_dir=None)
             visualize=visualize) as env:
         env = available_actions_printer.AvailableActionsPrinter(env)
         if checkpoint_dir is not None:
-            agents = [agent_cls(checkpoint_dir=checkpoint_dir) for agent_cls in agent_classes]
+            agents = []
+            for index, agent_cls in enumerate(agent_classes):
+                agents.append(_instantiate_agent(
+                    agent_cls,
+                    checkpoint_dir=checkpoint_dir,
+                    resume_checkpoint=resume_checkpoint if index == 0 else None,
+                ))
         else:
-            agents = [agent_cls() for agent_cls in agent_classes]
+            agents = []
+            for index, agent_cls in enumerate(agent_classes):
+                agents.append(_instantiate_agent(
+                    agent_cls,
+                    resume_checkpoint=resume_checkpoint if index == 0 else None,
+                ))
         run_loop.run_loop(agents, env, FLAGS.max_agent_steps, FLAGS.max_episodes, checkpoint_dir=checkpoint_dir)
         if FLAGS.save_replay:
             env.save_replay(agent_classes[0].__name__)
+            # local_replay_dir = replay_dir
+            # if FLAGS.artifact_backend == "s3" and replay_dir and is_s3_uri(replay_dir):
+            #     local_replay_dir = tempfile.mkdtemp(prefix="csc495_replays_")
+
+            # replay_path = env.save_replay(local_replay_dir or os.getcwd(), agent_classes[0].__name__)
+            # if FLAGS.artifact_backend == "s3" and replay_dir and is_s3_uri(replay_dir):
+            #     remote_replay_path = join_artifact_path(replay_dir, os.path.basename(replay_path))
+            #     upload_file(replay_path, remote_replay_path)
 
 
 def main(args):
     """Run an agent."""
+    if FLAGS.sc2path:
+        os.environ["SC2PATH"] = FLAGS.sc2path
+
     if FLAGS.trace:
         stopwatch.sw.trace()
     elif FLAGS.profile:
@@ -169,17 +218,25 @@ def main(args):
     # Build a per-run checkpoint directory based on agent type and time.
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     primary_agent_name = agent_classes[0].__name__
-    # checkpoint_dir = os.path.join("checkpoints", primary_agent_name, run_timestamp)
-    checkpoint_dir = None
+    checkpoint_dir = join_artifact_path(FLAGS.checkpoint_dir, primary_agent_name, run_timestamp)
+    replay_dir = join_artifact_path(FLAGS.replay_dir, primary_agent_name, run_timestamp)
+    resume_checkpoint = FLAGS.resume_checkpoint
+
+    if FLAGS.artifact_backend == "local":
+        if is_s3_uri(FLAGS.checkpoint_dir) or is_s3_uri(FLAGS.replay_dir) or is_s3_uri(FLAGS.resume_checkpoint):
+            raise ValueError("artifact_backend=local cannot be used with s3:// paths")
 
     threads = []
     for _ in range(FLAGS.parallel - 1):
         t = threading.Thread(target=run_thread,
-                            args=(agent_classes, players, FLAGS.map, False, checkpoint_dir))
+                            args=(agent_classes, players, FLAGS.map, False,
+                                  checkpoint_dir, replay_dir, resume_checkpoint))
         threads.append(t)
         t.start()
 
-    run_thread(agent_classes, players, FLAGS.map, FLAGS.render, checkpoint_dir)
+    run_thread(agent_classes, players, FLAGS.map,
+               FLAGS.render and not FLAGS.headless,
+               checkpoint_dir, replay_dir, resume_checkpoint)
 
     for t in threads:
         t.join()

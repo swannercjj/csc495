@@ -2,7 +2,6 @@
 import os
 import random
 from torch import nn
-import torch.nn.functional as F
 import torch.optim as optim
 import torch
 
@@ -11,7 +10,7 @@ from pysc2.lib import features
 from pysc2.agents.base_agent import BaseAgent
 
 from agent.replay import ReplayMemory, Transition
-from agent.utils import FLAT_FEATURES
+from agent.artifact_store import load_torch_state, save_torch_state
 from agent.alphastar.encoders import SpatialEncoder, ScalarEncoder
 from agent.alphastar.constants import SPATIAL_HIDDEN_DIM, SCALAR_HIDDEN_DIM
 import numpy as np
@@ -27,7 +26,6 @@ _NO_OP = actions.FUNCTIONS.no_op.id
 _PLAYER_SELF = features.PlayerRelative.SELF
 
 
-# TODO: simplify scenario
 
 class QNetwork(nn.Module):
     """
@@ -67,6 +65,36 @@ class QNetwork(nn.Module):
         return self.fc(combined)                                    # (B, n_actions)
 
 
+class DQNObservationPreprocessor:
+    """Build model inputs from raw PySC2 observations for DQN."""
+
+    def __init__(self, device: torch.device):
+        self.device = device
+
+    def preprocess(self, timestep):
+        observation = timestep.observation
+
+        screen = observation['feature_screen']
+        planes = np.stack([
+            screen.player_relative,
+            screen.unit_type,
+            screen.selected,
+            screen.unit_hit_points_ratio,
+            screen.unit_shields_ratio,
+            screen.unit_density,
+            screen.creep,
+            screen.height_map,
+        ], axis=0).astype(np.float32)
+
+        player_data = np.asarray(observation.player, dtype=np.float32)
+        player_data = np.nan_to_num(player_data, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+        return {
+            'spatial': torch.from_numpy(planes).unsqueeze(0).to(self.device),
+            'scalar': torch.from_numpy(player_data).unsqueeze(0).to(self.device),
+        }
+
+
 class DQNAgent(BaseAgent):
     def __init__(self,
                  lr=1e-3,
@@ -76,9 +104,10 @@ class DQNAgent(BaseAgent):
                  eps_start=1.0,
                  eps_end=0.05,
                  eps_decay=10000,
-                 target_update_freq=1000,
-                 checkpoint_interval=2,
+                 target_update_freq=250,
+                 checkpoint_interval=100,
                  checkpoint_dir=None,
+                 resume_checkpoint=None,
                  ):
         super(DQNAgent, self).__init__()
 
@@ -94,14 +123,19 @@ class DQNAgent(BaseAgent):
         self.target_update_freq = target_update_freq
         self.checkpoint_interval = checkpoint_interval
         self.checkpoint_dir = checkpoint_dir
+        self.resume_checkpoint = resume_checkpoint
 
         self.steps_done = 0
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.obs_preprocessor = DQNObservationPreprocessor(device=self.device)
 
         self.last_state = None
         self.last_action = None
+        self.last_available_actions = None
 
         self.episode_return = 0.0
+        self.raw_episode_return = 0.0
+        self.episode_score = 0.0
         self.episode_step = 0
         self.episode_index = 0
         self.last_loss = None
@@ -113,22 +147,26 @@ class DQNAgent(BaseAgent):
         base_dir = checkpoint_dir or self.checkpoint_dir
         if base_dir is None:
             base_dir = "checkpoints"
-        os.makedirs(base_dir, exist_ok=True)
 
         if episode_index is None:
             episode_index = self.episode_index
         filename = f"dqn_ep_{episode_index}.pt"
-        path = os.path.join(base_dir, filename)
-        torch.save(
-            {
-                "q_network_state_dict": self.q_network.state_dict(),
-                "target_network_state_dict": self.target_network.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "episode": episode_index,
-                "steps_done": self.steps_done,
-            },
-            path,
-        )
+        state = {
+            "q_network_state_dict": self.q_network.state_dict(),
+            "target_network_state_dict": self.target_network.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "episode": episode_index,
+            "steps_done": self.steps_done,
+        }
+        save_torch_state(state, base_dir, filename)
+
+    def load_checkpoint(self, checkpoint_path):
+        checkpoint = load_torch_state(checkpoint_path, map_location=self.device)
+        self.q_network.load_state_dict(checkpoint["q_network_state_dict"])
+        self.target_network.load_state_dict(checkpoint["target_network_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.episode_index = checkpoint.get("episode", 0)
+        self.steps_done = checkpoint.get("steps_done", 0)
 
     def _get_from_spec(self, spec, key):
         """Get value from obs_spec whether it's dict-like or has the key as attr."""
@@ -152,72 +190,11 @@ class DQNAgent(BaseAgent):
         self.target_network.load_state_dict(self.q_network.state_dict())
         self.optimizer = optim.Adam(self.q_network.parameters(), lr=self.lr)
 
-    # def _get_obs(self, obs):
-    #     """Convert PySC2 timestep observation to flat tensor for the DQN."""
-    #     observation = obs.observation
-    #     parts = []
-
-    #     # Flat player features: always length n_flat so observation size is fixed
-    #     n_flat = len(FLAT_FEATURES)
-    #     player = np.asarray(observation.player, dtype=np.float32)
-    #     flat = np.zeros(n_flat, dtype=np.float32)
-    #     for f in FLAT_FEATURES:
-    #         if f.index < len(player):
-    #             flat[f.index] = player[f.index]
-    #     parts.append(flat)
-
-    #     # Downsampled screen (only if setup() found feature_screen in obs_spec)
-    #     screen = observation['feature_screen']
-    #     n_screen_flat = (self.screen_trim_h // self.screen_pool_h) * (self.screen_trim_w // self.screen_pool_w) * self.screen_shape[0]
-    #     if screen is not None:
-    #         screen = np.asarray(screen)
-    #         h, w = screen.shape[1], screen.shape[2]
-    #         pool_h, pool_w = self.screen_pool_h, self.screen_pool_w
-    #         target_h = min(h, self.screen_trim_h)
-    #         target_w = min(w, self.screen_trim_w)
-    #         h_trim = (target_h // pool_h) * pool_h
-    #         w_trim = (target_w // pool_w) * pool_w
-    #         if h_trim > 0 and w_trim > 0:
-    #             screen_cropped = screen[:, :h_trim, :w_trim]
-    #             screen_flat = screen_cropped.reshape(screen.shape[0], h_trim // pool_h, pool_h, w_trim // pool_w, pool_w)
-    #             screen_flat = screen_flat.mean(axis=(2, 4)).flatten().astype(np.float32)
-    #             if screen_flat.size < n_screen_flat:
-    #                 screen_flat = np.concatenate([screen_flat, np.zeros(n_screen_flat - screen_flat.size, dtype=np.float32)])
-    #             elif screen_flat.size > n_screen_flat:
-    #                 screen_flat = screen_flat[:n_screen_flat]
-    #             parts.append(screen_flat)
-    #         else:
-    #             parts.append(np.zeros(n_screen_flat, dtype=np.float32))
-    #     else:
-    #         parts.append(np.zeros(n_screen_flat, dtype=np.float32))
-
-    #     x = np.concatenate(parts)
-    #     return torch.from_numpy(x).float().unsqueeze(0).to(self.device)
+        if self.resume_checkpoint:
+            self.load_checkpoint(self.resume_checkpoint)
 
     def _get_obs(self, obs):
-        observation = obs.observation
-
-        # Spatial: 8 screen feature planes matching SpatialEncoder's SPATIAL_CHANNELS=8
-        screen = observation['feature_screen']
-        planes = np.stack([
-            screen.player_relative,
-            screen.unit_type,
-            screen.selected,
-            screen.unit_hit_points_ratio,
-            screen.unit_shields_ratio,
-            screen.unit_density,
-            screen.creep,
-            screen.height_map,
-        ], axis=0).astype(np.float32)                                     # (8, H, W)
-
-        # Scalar: log1p-normalised player stats (ScalarEncoder applies log1p
-        # internally too, but passing raw values lets the encoder do it consistently)
-        player_data = np.array(observation.player, dtype=np.float32)     # (11,)
-
-        return {
-            'spatial': torch.from_numpy(planes).unsqueeze(0).to(self.device),     # (1, 8, H, W)
-            'scalar':  torch.from_numpy(player_data).unsqueeze(0).to(self.device) # (1, 11)
-        }
+        return self.obs_preprocessor.preprocess(obs)
 
     def _action_to_function_call(self, function_id, obs):
         """Convert function_id to PySC2 FunctionCall with valid args."""
@@ -232,17 +209,22 @@ class DQNAgent(BaseAgent):
         self.prev_self_health = 0.0
         self.last_state = None
         self.last_action = None
+        self.last_available_actions = None
         self.episode_return = 0.0
+        self.raw_episode_return = 0.0
+        self.episode_score = 0.0
         self.episode_step = 0
         self.episode_index += 1
 
     def step(self, obs):
         super(DQNAgent, self).step(obs)
         step_reward = self._get_shaped_reward(obs)
+        raw_step_reward = float(obs.reward)
 
         done = obs.last()
 
         self.episode_return += step_reward
+        self.raw_episode_return += raw_step_reward
         self.episode_step += 1
 
         state = self._get_obs(obs)
@@ -254,7 +236,9 @@ class DQNAgent(BaseAgent):
                 self.last_state, 
                 self.last_action, 
                 None if done else state, 
-                torch.tensor([[step_reward]], device=self.device, dtype=torch.float)
+                torch.tensor([[raw_step_reward]], device=self.device, dtype=torch.float),
+                self.last_available_actions,
+                None if done else available_actions,
             )
             self.optimize()
 
@@ -285,18 +269,22 @@ class DQNAgent(BaseAgent):
         # Store for next transition
         self.last_state = state
         self.last_action = torch.tensor([[function_id]], device=self.device, dtype=torch.long)
+        self.last_available_actions = available_actions
 
         if done:
+            current_score = np.asarray(obs.observation['score_cumulative'], dtype=np.float32)
+            if current_score.size > 0:
+                self.episode_score = float(current_score[0])
             if WANDB_AVAILABLE and wandb.run is not None:
                 wandb.log(
                     {
-                        "episode": int(self.episode_index),
                         "episode_return": float(self.episode_return),
+                        "raw_episode_return": float(self.raw_episode_return),
+                        "episode_score": float(self.episode_score),
                         "episode_length": int(self.episode_step),
-                        "epsilon": float(self.epsilon),
                         "steps_done": int(self.steps_done),
                         "last_loss": float(self.last_loss) if self.last_loss is not None else 0.0,
-                        "outcome": float(obs.reward)
+                        "outcome": raw_step_reward
                     }
                 )
 
@@ -337,8 +325,8 @@ class DQNAgent(BaseAgent):
         
         # Combine everything
         total_reward = (
-            (delta[3] * weights['mineral_collected']) +
-            (delta[4] * weights['vespene_collected']) +
+            (delta[7] * weights['mineral_collected']) +
+            (delta[8] * weights['vespene_collected']) +
             (delta[5] * weights['kill_unit']) +
             (delta[6] * weights['kill_building']) +
             (spent_delta * weights['spent_resources']) +  # Production reward
@@ -386,7 +374,7 @@ class DQNAgent(BaseAgent):
         state_scalars  = torch.cat([s['scalar']  for s in batch.state])
         
         action_batch = torch.cat(batch.action)
-        reward_batch = torch.cat(batch.reward)
+        reward_batch = torch.cat(batch.reward).view(-1)
 
         # 3. Compute Q(s_t, a)
         current_q_values = self.q_network({'spatial': state_spatials, 'scalar': state_scalars})
@@ -397,11 +385,25 @@ class DQNAgent(BaseAgent):
         if non_final_mask.any():
             non_final_next_spatials = torch.cat([s['spatial'] for s in batch.next_state if s is not None])
             non_final_next_scalars  = torch.cat([s['scalar']  for s in batch.next_state if s is not None])
+            non_final_next_available_actions = [
+                actions_for_state
+                for actions_for_state in batch.next_available_actions
+                if actions_for_state is not None
+            ]
             
             with torch.no_grad():
                 target_output = self.target_network({'spatial': non_final_next_spatials,
                                                      'scalar':  non_final_next_scalars})
-                next_state_values[non_final_mask] = target_output.max(1)[0]
+
+                invalid_mask = torch.full_like(target_output, -1e9)
+                for row_idx, actions_for_state in enumerate(non_final_next_available_actions):
+                    valid_actions = list(actions_for_state)
+                    if not valid_actions:
+                        valid_actions = [_NO_OP]
+                    invalid_mask[row_idx, valid_actions] = 0.0
+
+                masked_target_output = target_output + invalid_mask
+                next_state_values[non_final_mask] = masked_target_output.max(1)[0]
 
         # 5. Compute the expected Q values (Bellman Equation)
         expected_state_action_values = (next_state_values * self.gamma) + reward_batch

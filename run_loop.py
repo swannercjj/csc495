@@ -47,10 +47,10 @@ def run_loop(agents, env, max_frames=0, max_episodes=0, checkpoint_dir=None):
       if checkpoint_dir is not None:
         os.makedirs(checkpoint_dir, exist_ok=True)
         for agent in agents:
-          interval = getattr(agent, "checkpoint_interval", 2)
+          interval = getattr(agent, "checkpoint_interval", 50)
           if interval and hasattr(agent, "save_checkpoint"):
-            if total_episodes % interval == 0:
-              agent.save_checkpoint(total_episodes, checkpoint_dir=checkpoint_dir)
+            if getattr(agent, "episode_index", total_episodes) % interval == 0:
+              agent.save_checkpoint(checkpoint_dir=checkpoint_dir)
   except KeyboardInterrupt:
     pass
   finally:
