@@ -12,7 +12,6 @@ from pysc2.agents.base_agent import BaseAgent
 from agent.replay import ReplayMemory, Transition
 from agent.artifact_store import load_torch_state, save_torch_state
 from agent.alphastar.encoders import SpatialEncoder, ScalarEncoder
-from agent.alphastar.constants import SPATIAL_HIDDEN_DIM, SCALAR_HIDDEN_DIM
 import numpy as np
 
 try:
@@ -25,7 +24,8 @@ except ImportError:
 _NO_OP = actions.FUNCTIONS.no_op.id
 _PLAYER_SELF = features.PlayerRelative.SELF
 
-
+SCALAR_HIDDEN_DIM = 128  # Output dim of ScalarEncoder
+SPATIAL_HIDDEN_DIM = 256 # Output dim of SpatialEncoder projection
 
 class QNetwork(nn.Module):
     """
