@@ -294,7 +294,7 @@ class DQNAgent(BaseAgent):
                 self.last_state, 
                 self.last_action, 
                 None if done else state, 
-                torch.tensor([[raw_step_reward]], device=self.device, dtype=torch.float),
+                torch.tensor([[step_reward]], device=self.device, dtype=torch.float),
                 self.last_available_actions,
                 None if done else available_actions,
             )
