@@ -23,6 +23,7 @@ except ImportError:
 
 _NO_OP = actions.FUNCTIONS.no_op.id
 _PLAYER_SELF = features.PlayerRelative.SELF
+_PLAYER_NEUTRAL = getattr(features.PlayerRelative, "NEUTRAL", 3)
 
 SCALAR_HIDDEN_DIM = 128  # Output dim of ScalarEncoder
 SPATIAL_HIDDEN_DIM = 256 # Output dim of SpatialEncoder projection
@@ -93,6 +94,31 @@ class DQNObservationPreprocessor:
             'spatial': torch.from_numpy(planes).unsqueeze(0).to(self.device),
             'scalar': torch.from_numpy(player_data).unsqueeze(0).to(self.device),
         }
+
+
+def _is_spatial_arg(arg_spec) -> bool:
+    """Return True when an action argument represents a screen/minimap point."""
+    sizes = getattr(arg_spec, "sizes", ())
+    return len(sizes) == 2 and all(size > 1 for size in sizes)
+
+
+def _select_point_from_layers(layers):
+    """Choose a point from feature layers using a simple neutral-object heuristic."""
+    player_relative = np.asarray(layers.player_relative)
+    height, width = player_relative.shape
+
+    candidate_mask = player_relative == _PLAYER_NEUTRAL
+    if not candidate_mask.any():
+        candidate_mask = player_relative != _PLAYER_SELF
+
+    coords = np.argwhere(candidate_mask)
+    if coords.size == 0:
+        return width // 2, height // 2
+
+    y, x = coords.mean(axis=0)
+    x = int(np.clip(round(x), 0, width - 1))
+    y = int(np.clip(round(y), 0, height - 1))
+    return x, y
 
 
 class DQNAgent(BaseAgent):
@@ -196,11 +222,43 @@ class DQNAgent(BaseAgent):
     def _get_obs(self, obs):
         return self.obs_preprocessor.preprocess(obs)
 
+    def _select_spatial_point(self, obs, arg_spec):
+        """Pick a plausible target point for screen/minimap click arguments.
+
+        For mini-games, a useful default is the centroid of neutral map objects.
+        If no neutral targets are visible, fall back to the center of the screen.
+        """
+        if getattr(arg_spec, "name", "") == "minimap":
+            layers = obs.observation.get('feature_minimap')
+        else:
+            layers = obs.observation.get('feature_screen')
+
+        if layers is None:
+            return [0, 0]
+
+        x, y = _select_point_from_layers(layers)
+
+        if getattr(arg_spec, "name", "") == "screen2":
+            height, width = np.asarray(layers.player_relative).shape
+            x = min(width - 1, x + 1)
+            y = min(height - 1, y + 1)
+
+        return [x, y]
+
     def _action_to_function_call(self, function_id, obs):
-        """Convert function_id to PySC2 FunctionCall with valid args."""
+        """Convert a high-level function choice into a full PySC2 action.
+
+        The DQN selects the function id. Spatial arguments are filled by a
+        separate low-level selector so the action becomes hierarchical instead
+        of a single flat discrete choice.
+        """
         func = self.action_spec.functions[function_id]
-        args = [[np.random.randint(0, size) for size in arg.sizes]
-                for arg in func.args]
+        args = []
+        for arg in func.args:
+            if _is_spatial_arg(arg):
+                args.append(self._select_spatial_point(obs, arg))
+            else:
+                args.append([np.random.randint(0, size) for size in arg.sizes])
         return actions.FunctionCall(function_id, args)
 
     def reset(self):

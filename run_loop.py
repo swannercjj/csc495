@@ -50,7 +50,10 @@ def run_loop(agents, env, max_frames=0, max_episodes=0, checkpoint_dir=None):
           interval = getattr(agent, "checkpoint_interval", 50)
           if interval and hasattr(agent, "save_checkpoint"):
             if getattr(agent, "episode_index", total_episodes) % interval == 0:
-              agent.save_checkpoint(checkpoint_dir=checkpoint_dir)
+              try:
+                agent.save_checkpoint(checkpoint_dir=checkpoint_dir)
+              except Exception as exc:  # Keep long runs alive if artifact upload fails.
+                print(f"WARNING: checkpoint save failed and will be skipped: {exc}")
   except KeyboardInterrupt:
     pass
   finally:
