@@ -4,6 +4,7 @@ import random
 from torch import nn
 import torch.optim as optim
 import torch
+import torch.nn.functional as F
 
 from pysc2.lib import actions
 from pysc2.lib import features
@@ -23,7 +24,6 @@ except ImportError:
 
 _NO_OP = actions.FUNCTIONS.no_op.id
 _PLAYER_SELF = features.PlayerRelative.SELF
-_PLAYER_NEUTRAL = getattr(features.PlayerRelative, "NEUTRAL", 3)
 
 SCALAR_HIDDEN_DIM = 128  # Output dim of ScalarEncoder
 SPATIAL_HIDDEN_DIM = 256 # Output dim of SpatialEncoder projection
@@ -58,12 +58,32 @@ class QNetwork(nn.Module):
             nn.ReLU(),
             nn.Linear(256, n_actions),
         )
+        self.spatial_q_head = nn.Sequential(
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 1, kernel_size=1),
+        )
 
-    def forward(self, obs_dict: dict) -> torch.Tensor:
-        _, spatial_enc = self.spatial_encoder(obs_dict['spatial'])  # (B, 256)
+    def forward(self, obs_dict: dict) -> dict:
+        map_skip, spatial_enc = self.spatial_encoder(obs_dict['spatial'])  # (B, 128, h, w), (B, 256)
         scalar_enc     = self.scalar_encoder(obs_dict['scalar'])    # (B, 128)
         combined = torch.cat([spatial_enc, scalar_enc], dim=1)      # (B, 384)
-        return self.fc(combined)                                    # (B, n_actions)
+        function_q = self.fc(combined)                              # (B, n_actions)
+
+        spatial_q = self.spatial_q_head(map_skip).squeeze(1)        # (B, h, w)
+        target_h, target_w = obs_dict['spatial'].shape[-2:]
+        if spatial_q.shape[-2:] != (target_h, target_w):
+            spatial_q = F.interpolate(
+                spatial_q.unsqueeze(1),
+                size=(target_h, target_w),
+                mode='bilinear',
+                align_corners=False,
+            ).squeeze(1)
+
+        return {
+            'function_q': function_q,
+            'spatial_q': spatial_q,
+        }
 
 
 class DQNObservationPreprocessor:
@@ -100,25 +120,6 @@ def _is_spatial_arg(arg_spec) -> bool:
     """Return True when an action argument represents a screen/minimap point."""
     sizes = getattr(arg_spec, "sizes", ())
     return len(sizes) == 2 and all(size > 1 for size in sizes)
-
-
-def _select_point_from_layers(layers):
-    """Choose a point from feature layers using a simple neutral-object heuristic."""
-    player_relative = np.asarray(layers.player_relative)
-    height, width = player_relative.shape
-
-    candidate_mask = player_relative == _PLAYER_NEUTRAL
-    if not candidate_mask.any():
-        candidate_mask = player_relative != _PLAYER_SELF
-
-    coords = np.argwhere(candidate_mask)
-    if coords.size == 0:
-        return width // 2, height // 2
-
-    y, x = coords.mean(axis=0)
-    x = int(np.clip(round(x), 0, width - 1))
-    y = int(np.clip(round(y), 0, height - 1))
-    return x, y
 
 
 class DQNAgent(BaseAgent):
@@ -222,30 +223,42 @@ class DQNAgent(BaseAgent):
     def _get_obs(self, obs):
         return self.obs_preprocessor.preprocess(obs)
 
-    def _select_spatial_point(self, obs, arg_spec):
-        """Pick a plausible target point for screen/minimap click arguments.
+    def _get_first_spatial_arg(self, function_id):
+        """Return the first point-like argument spec for a function, if any."""
+        func = self.action_spec.functions[function_id]
+        for arg in func.args:
+            if _is_spatial_arg(arg):
+                return arg
+        return None
 
-        For mini-games, a useful default is the centroid of neutral map objects.
-        If no neutral targets are visible, fall back to the center of the screen.
-        """
-        if getattr(arg_spec, "name", "") == "minimap":
-            layers = obs.observation.get('feature_minimap')
-        else:
-            layers = obs.observation.get('feature_screen')
-
-        if layers is None:
-            return [0, 0]
-
-        x, y = _select_point_from_layers(layers)
-
-        if getattr(arg_spec, "name", "") == "screen2":
-            height, width = np.asarray(layers.player_relative).shape
-            x = min(width - 1, x + 1)
-            y = min(height - 1, y + 1)
-
+    def _select_q_point_from_map(self, spatial_q_map):
+        """Greedy coordinate choice on the learned spatial Q-map."""
+        height, width = spatial_q_map.shape
+        flat_idx = int(torch.argmax(spatial_q_map).item())
+        y = flat_idx // width
+        x = flat_idx % width
         return [x, y]
 
-    def _action_to_function_call(self, function_id, obs):
+    def _project_q_point_to_arg(self, q_point, arg_spec, q_width, q_height):
+        """Project a coordinate from Q-map space into argument coordinate space."""
+        arg_width = max(1, int(arg_spec.sizes[0]))
+        arg_height = max(1, int(arg_spec.sizes[1]))
+
+        x_q = int(np.clip(q_point[0], 0, q_width - 1))
+        y_q = int(np.clip(q_point[1], 0, q_height - 1))
+
+        if q_width == 1:
+            x_arg = 0
+        else:
+            x_arg = int(round(x_q * (arg_width - 1) / (q_width - 1)))
+        if q_height == 1:
+            y_arg = 0
+        else:
+            y_arg = int(round(y_q * (arg_height - 1) / (q_height - 1)))
+
+        return [x_arg, y_arg]
+
+    def _action_to_function_call(self, function_id, obs, q_point=None, q_map_shape=None):
         """Convert a high-level function choice into a full PySC2 action.
 
         The DQN selects the function id. Spatial arguments are filled by a
@@ -256,7 +269,16 @@ class DQNAgent(BaseAgent):
         args = []
         for arg in func.args:
             if _is_spatial_arg(arg):
-                args.append(self._select_spatial_point(obs, arg))
+                if q_point is not None and q_map_shape is not None:
+                    point = self._project_q_point_to_arg(
+                        q_point,
+                        arg,
+                        q_width=q_map_shape[0],
+                        q_height=q_map_shape[1],
+                    )
+                    args.append(point)
+                else:
+                    args.append([np.random.randint(0, size) for size in arg.sizes])
             else:
                 args.append([np.random.randint(0, size) for size in arg.sizes])
         return actions.FunctionCall(function_id, args)
@@ -310,23 +332,46 @@ class DQNAgent(BaseAgent):
         self.epsilon = eps_threshold
         self.steps_done += 1
 
+        spatial_height, spatial_width = state['spatial'].shape[-2:]
+        chosen_q_point = [-1, -1]
+        function_id = _NO_OP
+
         if random.random() > eps_threshold:
             with torch.no_grad():
-                q_values = self.q_network(state)
+                q_output = self.q_network(state)
+                q_values = q_output['function_q']
+                spatial_q_map = q_output['spatial_q'][0]
                 # Mask invalid actions
                 mask = torch.full((1, self.n_actions), -1e9, device=self.device)
                 for a in available_actions:
                     mask[0, a] = 0
                 action_idx = (q_values + mask).argmax(1).item()
                 function_id = action_idx
+
+                if self._get_first_spatial_arg(function_id) is not None:
+                    chosen_q_point = self._select_q_point_from_map(spatial_q_map)
         else:
             function_id = np.random.choice(available_actions)
+            if self._get_first_spatial_arg(function_id) is not None:
+                chosen_q_point = [
+                    np.random.randint(0, spatial_width),
+                    np.random.randint(0, spatial_height),
+                ]
 
-        function_call = self._action_to_function_call(function_id, obs)
+        function_call = self._action_to_function_call(
+            function_id,
+            obs,
+            q_point=chosen_q_point if chosen_q_point[0] >= 0 else None,
+            q_map_shape=(spatial_width, spatial_height),
+        )
 
         # Store for next transition
         self.last_state = state
-        self.last_action = torch.tensor([[function_id]], device=self.device, dtype=torch.long)
+        self.last_action = torch.tensor(
+            [[function_id, chosen_q_point[0], chosen_q_point[1]]],
+            device=self.device,
+            dtype=torch.long,
+        )
         self.last_available_actions = available_actions
 
         if done:
@@ -432,11 +477,17 @@ class DQNAgent(BaseAgent):
         state_scalars  = torch.cat([s['scalar']  for s in batch.state])
         
         action_batch = torch.cat(batch.action)
+        function_action_batch = action_batch[:, 0].unsqueeze(1)
+        point_x_batch = action_batch[:, 1]
+        point_y_batch = action_batch[:, 2]
+        spatial_action_mask = (point_x_batch >= 0) & (point_y_batch >= 0)
         reward_batch = torch.cat(batch.reward).view(-1)
 
         # 3. Compute Q(s_t, a)
-        current_q_values = self.q_network({'spatial': state_spatials, 'scalar': state_scalars})
-        state_action_values = current_q_values.gather(1, action_batch)
+        current_q_output = self.q_network({'spatial': state_spatials, 'scalar': state_scalars})
+        current_function_q = current_q_output['function_q']
+        current_spatial_q = current_q_output['spatial_q']
+        state_action_values = current_function_q.gather(1, function_action_batch)
 
         # 4. Compute V(s_{t+1}) for all non-terminal next states
         next_state_values = torch.zeros(self.batch_size, device=self.device)
@@ -451,7 +502,7 @@ class DQNAgent(BaseAgent):
             
             with torch.no_grad():
                 target_output = self.target_network({'spatial': non_final_next_spatials,
-                                                     'scalar':  non_final_next_scalars})
+                                                     'scalar':  non_final_next_scalars})['function_q']
 
                 invalid_mask = torch.full_like(target_output, -1e9)
                 for row_idx, actions_for_state in enumerate(non_final_next_available_actions):
@@ -467,7 +518,24 @@ class DQNAgent(BaseAgent):
         expected_state_action_values = (next_state_values * self.gamma) + reward_batch
 
         # 6. Loss and Backprop
-        loss = self.criterion(state_action_values, expected_state_action_values.unsqueeze(1))
+        function_loss = self.criterion(state_action_values, expected_state_action_values.unsqueeze(1))
+
+        spatial_loss = torch.tensor(0.0, device=self.device)
+        if spatial_action_mask.any():
+            spatial_rows = torch.arange(self.batch_size, device=self.device)[spatial_action_mask]
+            spatial_x = point_x_batch[spatial_action_mask].long()
+            spatial_y = point_y_batch[spatial_action_mask].long()
+
+            max_height = current_spatial_q.shape[1] - 1
+            max_width = current_spatial_q.shape[2] - 1
+            spatial_x = torch.clamp(spatial_x, 0, max_width)
+            spatial_y = torch.clamp(spatial_y, 0, max_height)
+
+            chosen_spatial_values = current_spatial_q[spatial_rows, spatial_y, spatial_x]
+            spatial_targets = expected_state_action_values[spatial_action_mask]
+            spatial_loss = self.criterion(chosen_spatial_values, spatial_targets)
+
+        loss = function_loss + spatial_loss
         self.optimizer.zero_grad()
         loss.backward()
         
