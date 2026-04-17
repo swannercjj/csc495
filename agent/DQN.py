@@ -390,7 +390,7 @@ class DQNAgent(BaseAgent):
         self.steps_done += 1
 
         spatial_height, spatial_width = state['spatial'].shape[-2:]
-        if not available_actions:
+        if len(available_actions) == 0:
             available_actions = [_NO_OP]
 
         with torch.no_grad():
