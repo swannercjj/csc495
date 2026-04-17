@@ -246,34 +246,20 @@ class DQNAgent(BaseAgent):
                 return arg
         return None
 
-    def _sample_index_from_q(self, q_values, temperature):
-        """Sample an index from Q-values using a Boltzmann policy."""
-        if q_values.numel() == 0:
-            return 0
-
-        t = max(float(temperature), 1e-3)
-        scaled = q_values / t
-        probs = torch.softmax(scaled, dim=0)
-
-        if torch.isnan(probs).any() or torch.isinf(probs).any() or probs.sum() <= 0:
-            return int(torch.argmax(q_values).item())
-
-        return int(torch.multinomial(probs, num_samples=1).item())
-
-    def _select_q_point_from_map(self, spatial_q_map, temperature):
-        """Coordinate choice on the learned spatial Q-map."""
+    def _select_q_point_from_map(self, spatial_q_map):
+        """Greedy coordinate choice on the learned spatial Q-map."""
         height, width = spatial_q_map.shape
-        flat_idx = self._sample_index_from_q(spatial_q_map.reshape(-1), temperature)
+        flat_idx = int(torch.argmax(spatial_q_map.reshape(-1)).item())
         y = flat_idx // width
         x = flat_idx % width
         return [x, y]
 
-    def _select_non_spatial_arg(self, arg_q_dict, arg_spec, temperature):
-        """Choose a non-spatial argument value from its learned Q-head."""
+    def _select_non_spatial_arg(self, arg_q_dict, arg_spec):
+        """Greedy non-spatial argument choice from its learned Q-head."""
         logits = arg_q_dict.get(arg_spec.name)
         if logits is None:
             raise ValueError(f"Missing learned head for arg type: {arg_spec.name}")
-        return self._sample_index_from_q(logits[0], temperature)
+        return int(torch.argmax(logits[0]).item())
 
     def _project_q_point_to_arg(self, q_point, arg_spec, q_width, q_height):
         """Project a coordinate from Q-map space into argument coordinate space."""
@@ -397,21 +383,32 @@ class DQNAgent(BaseAgent):
             q_output = self.q_network(state)
             q_values = q_output['function_q']
             spatial_q_map = q_output['spatial_q'][0]
-            temperature = max(0.05, eps_threshold)
 
-            # Mask invalid actions, then sample from learned Q-values.
-            masked_q = torch.full((self.n_actions,), -1e9, device=self.device)
-            masked_q[available_actions] = q_values[0, available_actions]
-            function_id = self._sample_index_from_q(masked_q, temperature)
+            # Epsilon-greedy function selection with available-action masking.
+            if random.random() < eps_threshold:
+                function_id = int(np.random.choice(available_actions))
+            else:
+                masked_q = torch.full((self.n_actions,), -1e9, device=self.device)
+                masked_q[available_actions] = q_values[0, available_actions]
+                function_id = int(torch.argmax(masked_q).item())
 
             func = self.action_spec.functions[function_id]
             chosen_spatial_points = []
             chosen_arg_values = {}
             for arg in func.args:
                 if _is_spatial_arg(arg):
-                    chosen_spatial_points.append(self._select_q_point_from_map(spatial_q_map, temperature))
+                    if random.random() < eps_threshold:
+                        chosen_spatial_points.append([
+                            int(np.random.randint(0, spatial_width)),
+                            int(np.random.randint(0, spatial_height)),
+                        ])
+                    else:
+                        chosen_spatial_points.append(self._select_q_point_from_map(spatial_q_map))
                 else:
-                    chosen_arg_values[arg.id] = self._select_non_spatial_arg(q_output['arg_q'], arg, temperature)
+                    if random.random() < eps_threshold:
+                        chosen_arg_values[arg.id] = int(np.random.randint(0, int(arg.sizes[0])))
+                    else:
+                        chosen_arg_values[arg.id] = self._select_non_spatial_arg(q_output['arg_q'], arg)
 
         function_call = self._action_to_function_call(
             function_id,
@@ -616,7 +613,7 @@ class DQNAgent(BaseAgent):
             arg_targets = expected_state_action_values[arg_mask]
             arg_loss = arg_loss + self.criterion(chosen_q, arg_targets)
 
-        loss = function_loss + spatial_loss + arg_loss
+        loss = function_loss + (0.2 * spatial_loss) + (0.1 * arg_loss)
         self.optimizer.zero_grad()
         loss.backward()
         
