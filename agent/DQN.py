@@ -146,7 +146,7 @@ class DQNAgent(BaseAgent):
                  eps_start=1.0,
                  eps_end=0.05,
                  eps_decay=10000,
-                 target_update_freq=250,
+                 target_update_freq=1000,
                  checkpoint_interval=100,
                  checkpoint_dir=None,
                  resume_checkpoint=None,
